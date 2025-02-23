@@ -6,14 +6,21 @@ const constants = @import("constants.zig");
 const Controller = @This();
 pub const DefaultControllers: [constants.max_controller_count]Controller = [_]Controller{.{}} ** constants.max_controller_count;
 
+const AssignmentState = enum {
+    unassigned, assigned, wants_assignment,
+};
+
+// TODO: player_index would be a better name
 input_index: usize = std.math.maxInt(usize),
+
+assignment_state: AssignmentState = AssignmentState.unassigned,
 polled_state: input.PlayerInputState = input.PlayerInputState{},
 
 pub inline fn isAssigned(self: Controller) bool {
-    return self.input_index < constants.max_player_count;
+    return self.assignment_state == .assigned;
 }
 
-pub fn givingInputs(controller: Controller) bool {
+pub fn wantsToJoin(controller: Controller) bool {
     return controller.polled_state.button_a.is_down() or controller.polled_state.button_b.is_down();
 }
 
@@ -123,7 +130,10 @@ fn pollGamepad(gamepad: i32, previous: input.PlayerInputState) input.PlayerInput
 }
 
 /// Polls the state of all input devices possible.
-pub fn pollAll(controllers: []Controller, previous: input.AllPlayerButtons) void {
+/// It will return the amount of players that this client wants to own.
+pub fn pollAll(controllers: []Controller, previous: input.AllPlayerButtons) u32 {
+    var wanted_player_count: u32 = 0;
+
     for (controllers, 0..) |*controller, nth_controller| {
         const previous_buttons = if (controller.isAssigned()) previous[controller.input_index] else input.PlayerInputState{};
         controller.polled_state = switch (nth_controller) {
@@ -131,5 +141,35 @@ pub fn pollAll(controllers: []Controller, previous: input.AllPlayerButtons) void
             1 => pollKeyboard2(previous_buttons),
             else => pollGamepad(@intCast(nth_controller - 2), previous_buttons),
         };
+
+        if (controller.assignment_state == .unassigned) {
+            if (controller.wantsToJoin()) {
+                controller.assignment_state = .wants_assignment;
+                wanted_player_count += 1;
+            }
+        } else {
+            wanted_player_count += 1;
+        }
+    }
+
+    return wanted_player_count;
+}
+
+pub fn autoAssign(controllers: []Controller, owned_players: input.PlayerBitSet) void {
+    var available = owned_players;
+    for (controllers) |controller| {
+        if (controller.isAssigned()) {
+            available.unset(controller.input_index);
+        }
+    }
+
+    for (controllers) |*controller| {
+        if (controller.assignment_state == .wants_assignment) {
+            if (available.findFirstSet()) |player_index| {
+                available.unset(player_index);
+                controller.input_index = player_index;
+                controller.assignment_state = .assigned;
+            }
+        }
     }
 }

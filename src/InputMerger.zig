@@ -12,7 +12,10 @@ const PlayerBitSetArrayList = std.ArrayListUnmanaged(input.PlayerBitSet);
 rw_lock: std.Thread.RwLock = .{},
 buttons: InputStateArrayList,
 is_certain: PlayerBitSetArrayList,
-is_server: bool = false, // Only used for debug prints. TODO: Remove in favour of a logger that is aware.
+is_local: PlayerBitSetArrayList,
+
+prediction_fix_start: u64 = 1,
+prediction_fix_end: u64 = 1,
 
 pub fn init(allocator: std.mem.Allocator) !Self {
     // We append one to each array because extendTimeline() must have at least one frame available
@@ -25,41 +28,101 @@ pub fn init(allocator: std.mem.Allocator) !Self {
     var is_certain = try PlayerBitSetArrayList.initCapacity(allocator, 1024);
     try is_certain.append(allocator, input.full_player_bit_set);
 
+    // First input was not created locally. It is just universally known.
+    var is_local = try PlayerBitSetArrayList.initCapacity(allocator, 1024);
+    try is_local.append(allocator, input.empty_player_bit_set);
+
     return .{
         .buttons = buttons,
         .is_certain = is_certain,
+        .is_local = is_local,
     };
 }
 
+/// Includes a region to be re-predicted.
+/// If this function isn't called where predictions are 
+/// made a desynch can happen.
+fn mustFixPrediction(self: *Self, start: u64, end: u64) void {
+    self.prediction_fix_start = @min(self.prediction_fix_start, start);
+    self.prediction_fix_end = @max(self.prediction_fix_end, end);
+}
+
+/// Does prediciton for the area that might contain
+/// outdated predicitons.
+/// Returns std.math.maxInt(u64) if no predictions were made.
+pub fn fixInputPredictions(self: *Self) u64 {
+    var rewind_to_tick: u64 = std.math.maxInt(u64);
+    var guess_buttons = input.default_input_state;
+
+
+    if (self.prediction_fix_start >= self.prediction_fix_end) {
+        // Nothing to predict.
+        return rewind_to_tick;
+    }
+
+    // We actually start one tick before so that we can be sure that the
+    // first tick we process is safe to guess from.
+    const start = self.prediction_fix_start - 1;
+
+    for(start..self.prediction_fix_end) |input_index| {
+        for (0..constants.max_player_count) |player| {
+            if (self.is_certain.items[input_index].isSet(player) or input_index == start) {
+                // We are sure of this input. So we may use it to inspire future predicitions.
+                guess_buttons[player] = self.buttons.items[input_index][player];
+
+                // It doesn't make sense for the prediction
+                // to be that the player keeps button mashing at a pefect
+                // 1 click per tick. So we adjust it.
+                guess_buttons[player].button_a = guess_buttons[player].button_a.prediction();
+                guess_buttons[player].button_b = guess_buttons[player].button_b.prediction();
+            } else if (!std.meta.eql(self.buttons.items[input_index][player], guess_buttons[player])) {
+                // Old prediction is different from new prediction. So we may change.
+                self.buttons.items[input_index][player] = guess_buttons[player];
+                rewind_to_tick = @min(rewind_to_tick, input_index);
+            }
+        }
+    }
+
+    self.prediction_fix_start = std.math.maxInt(u64);
+    self.prediction_fix_end = 0;
+
+    return rewind_to_tick;
+}
+
 pub fn extendTimeline(self: *Self, allocator: std.mem.Allocator, tick: u64) !void {
-    if (tick + 1 < self.buttons.items.len) {
+    const new_len = tick + 1;
+
+    if (new_len < self.buttons.items.len) {
         // No need to extend the timeline.
         return;
     }
 
-    var guess_buttons = self.buttons.getLast();
-    for (&guess_buttons) |*guess_player| {
-        // It doesn't make sense for the prediction
-        // to be that the player keeps button mashing at a pefect
-        // 1 click per tick. So we adjust it.
-        guess_player.button_a = guess_player.button_a.prediction();
-        guess_player.button_b = guess_player.button_b.prediction();
-    }
     const start = self.buttons.items.len;
 
-    try self.buttons.ensureTotalCapacity(allocator, tick + 1);
-    self.buttons.items.len = tick + 1;
-    try self.is_certain.ensureTotalCapacity(allocator, tick + 1);
-    self.is_certain.items.len = tick + 1;
+    try self.buttons.ensureTotalCapacity(allocator, new_len);
+    self.buttons.items.len = new_len;
+
+    try self.is_certain.ensureTotalCapacity(allocator, new_len);
+    self.is_certain.items.len = new_len;
+
+    try self.is_local.ensureTotalCapacity(allocator, new_len);
+    self.is_local.items.len = new_len;
 
     for (self.buttons.items[start..]) |*frame| {
-        frame.* = guess_buttons;
+        frame.* = input.default_input_state;
     }
 
     for (self.is_certain.items[start..]) |*frame| {
         // We are always unsure when we are guessing.
         frame.* = input.empty_player_bit_set;
     }
+
+    for (self.is_local.items[start..]) |*frame| {
+        // No inputs have been set yet.
+        frame.* = input.empty_player_bit_set;
+    }
+
+    self.mustFixPrediction(start, new_len);
 }
 
 pub fn localUpdate(self: *Self, controllers: []Controller, tick: u64) !void {
@@ -67,6 +130,7 @@ pub fn localUpdate(self: *Self, controllers: []Controller, tick: u64) !void {
     std.debug.assert(tick < self.buttons.items.len);
 
     var is_certain = self.is_certain.items[tick];
+    var is_local = self.is_local.items[tick];
     for (controllers) |controller| {
         const player = controller.input_index;
         if (controller.isAssigned()) {
@@ -76,101 +140,52 @@ pub fn localUpdate(self: *Self, controllers: []Controller, tick: u64) !void {
             }
             self.buttons.items[tick][player] = controller.polled_state;
             is_certain.set(player);
+            is_local.set(player);
+
         }
     }
     self.is_certain.items[tick] = is_certain;
+    self.is_local.items[tick] = is_local;
+
+    self.mustFixPrediction(tick, tick + 1);
+}
+
+pub fn undoUpdate(self: *Self, player: u32, tick: u64) void {
+    if (tick >= self.is_local.items.len) {
+        // No point in undoing something outside of the current timeline.
+        return;
+    }
+
+    // The server said it did not accept the local input. So undo this local input if it is local.
+    if (self.is_local.items[tick].isSet(player)) {
+        self.is_local.items[tick].unset(player);
+        self.is_certain.items[tick].unset(player);
+
+        // The mustFixPrediction call will ensure that we set a more reasonable guess for this input.
+        self.mustFixPrediction(tick, tick + 1);
+        std.debug.print("warning, local input was removed for player {} at {}\n", .{player, tick});
+    }
 }
 
 /// Returns true if the timeline was changed by this call.
 pub fn remoteUpdate(self: *Self, allocator: std.mem.Allocator, player: u32, new_state: input.PlayerInputState, tick: u64) !bool {
-    //if (tick < self.newest_remote_frame) {
-    //    std.debug.print("newest_remote_frame: {d}, tick: {d}\n", .{self.newest_remote_frame, tick});
-    //    @panic("the inputs came out of order");
-    //}
-
     try self.extendTimeline(allocator, tick);
 
-    // The amount of player inputs that were mutated by this call.
-    var changes: u64 = 0;
-
-    //std.debug.print("remote update for player {d} at tick {d}\n", .{player, tick});
-    for (self.buttons.items[tick..], self.is_certain.items[tick..]) |*frame, is_certain| {
-        if (is_certain.isSet(player)) {
-            // We are already certain of this input. Nothing to do here.
-            // This is probably just the server re-broadcasting the input that the client sent it.
-            // But it could also be an error... Oh well!
-            break;
-        }
-        if (std.meta.eql(frame[player], new_state)) {
-            // No need to change this frame in particular.
-            continue;
-        }
-        frame[player] = new_state;
-        changes += 1;
-    }
-
-    // We will not let anyone override this input in the future.
+    // We will not let local input override this input in the future.
     // It is locked in for consistency.
     // Setting this flag also lets us know that it is worth sending in the net-code.
     // We only set consistency for <tick> because future values are just "guesses".
     self.is_certain.items[tick].set(player);
 
-    //std.debug.print("{} after remote update {b}\n", .{self.is_server, self.is_certain.items[tick].mask});
+    self.mustFixPrediction(tick, tick + 1);
 
-    return changes != 0;
-}
-
-pub fn forceAutoAssign(self: *Self, prev_tick: u64, controllers: []Controller, nth_controller: usize) bool {
-    // Works a bit like localUpdate() but forces a controller to go online (for testing).
-
-    // Make sure that extendTimeline() is called before.
-    std.debug.assert(prev_tick < self.buttons.items.len);
-    const inputs = self.buttons.items[prev_tick];
-
-    // Find an available player.
-    var unavailable = [_]bool{false} ** constants.max_player_count;
-    for (inputs, 0..) |inp, player_index| {
-        if (inp.is_connected()) {
-            unavailable[player_index] = true;
-        }
+    if (std.meta.eql(self.buttons.items[tick][player], new_state)) {
+        return false;
     }
 
-    // We also check the controllers in case two or more controllers
-    // were force-assigned the same tick. This way we avoid having
-    // to change the timeline to prevent this.
-    for (controllers) |controller| {
-        if (controller.isAssigned()) {
-            unavailable[controller.input_index] = true;
-        }
-    }
-    const available = std.mem.indexOfScalar(bool, &unavailable, false);
+    self.buttons.items[tick][player] = new_state;
 
-    // Assign the available plyer to nth_controller.
-    if (available) |available_player| {
-        std.debug.print("Controller {} joined with id {}\n", .{ nth_controller, available_player });
-        controllers[nth_controller].input_index = available_player;
-        return true;
-    }
-    return false;
-}
-
-pub fn autoAssign(self: *Self, controllers: []Controller, prev_tick: u64) usize {
-    var count: usize = 0;
-    for (controllers, 0..) |controller, nth_controller| {
-        if (controller.isAssigned()) {
-            count += 1;
-            continue;
-        }
-        if (!controller.givingInputs()) {
-            continue;
-        }
-        if (self.forceAutoAssign(prev_tick, controllers, nth_controller)) {
-            // Increase if we are successful in force-assigning this controller.
-            // The if-statement will change our state a bit.
-            count += 1;
-        }
-    }
-    return count;
+    return true;
 }
 
 pub fn createChecksum(self: *Self, until: u64) u32 {

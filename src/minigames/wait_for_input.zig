@@ -2,8 +2,8 @@
 /// This is done so that we do not need to call init() in two places. Do not put important stuff in this
 /// minigame's init() as it is never called as a consequences. In fact, expect almost everything to not be
 /// initialized properly.
-/// The minigame will wait 4 ticks, then start checking if at least
-/// one player exists (or if we wish to switch to the lobby).
+/// The minigame will wait 4 ticks, then start checking if enough
+/// players exists (or if we wish to switch to the lobby).
 
 const simulation = @import("../simulation.zig");
 const input = @import("../input.zig");
@@ -18,15 +18,17 @@ pub fn update(sim: *simulation.Simulation, timeline: input.Timeline, _: Invariab
     // TODO: Spawn a sprite informing users they should press Z/X (A/B) to connect a player.
     // TODO: Also the mainmenu minigame should always have a connected controller somehow.
 
-    var has_inputs = false;
+    var players_connected: u32 = 0;
     for (timeline.latest()) |player| {
-        has_inputs = player.is_connected() or has_inputs;
+        if (player.is_connected()) {
+            players_connected += 1;
+        }
     }
 
     const wants_lobby = sim.meta.preferred_minigame_id == constants.minigame_lobby;
 
     if (sim.meta.minigame_counter >= 4) {
-        if (has_inputs or wants_lobby) {
+        if (players_connected >= sim.meta.min_players or wants_lobby) {
             sim.meta.minigame_id = sim.meta.preferred_minigame_id;
         }
     }

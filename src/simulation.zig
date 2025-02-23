@@ -15,6 +15,9 @@ pub const Metadata = struct {
     /// as that is the current ID of "preferred".
     preferred_minigame_id: u32 = 0,
 
+    /// How many players to wait for until leaving the wait_for_input minigame.
+    min_players: u16 = 0,
+
     minigame_id: u32 = 0,
     minigame_prng: std.rand.DefaultPrng = std.rand.DefaultPrng.init(seed),
     minigame_timer: u32 = 0,
